@@ -1,0 +1,9 @@
+{
+  "matcher": "",
+  "hooks": [
+    {
+      "type": "command",
+      "command": "bash ~/.claude/scripts/track-turn-cost.sh"
+    }
+  ]
+}
