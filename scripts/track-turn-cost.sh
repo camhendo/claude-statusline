@@ -286,6 +286,7 @@ jq -n \
   [[ "$cur_in_overage" -eq 0 && ! -f "$state_file" ]] && exit 0
 
   now_iso=$(date -u "+%Y-%m-%dT%H:%M:%SZ")
+  now_unix=$(date -u +%s)
 
   # Convert a resets_at value (epoch string or ISO-8601) to unix seconds.
   # Claude Code has shipped both formats; we accept either transparently.
@@ -342,10 +343,46 @@ jq -n \
   done
   trap 'rmdir "'"$lock_dir"'" 2>/dev/null' EXIT HUP INT TERM
 
-  # Load existing state (or empty).
+  # ── Load existing state (and migrate from old schema in place) ──────────────
+  # Old schema (5h-window-only): {window_key, window_start_iso, window_end_iso,
+  #                               crossover_ts, sessions, total_overage_usd}
+  # New schema (episode):        {episode_start_ts, active_triggers, triggers_ever,
+  #                               seen_resets, sessions, total_overage_usd}
+  #
+  # If we encounter the old schema, we handle it one of two ways:
+  #   (a) Old 5h window has already ended (window_end_iso <= now_unix) → finalize
+  #       as a closed episode ending at window_end_iso, assume trigger was 5h.
+  #   (b) Old 5h window is still live → rewrite the state object in place to the
+  #       new schema, preserving sessions + total_overage_usd verbatim so the
+  #       in-flight $ value is not lost.
   existing_state=''
   if [[ -f "$state_file" ]]; then
       existing_state=$(cat "$state_file" 2>/dev/null)
+      is_old_schema=$(echo "${existing_state:-null}" | jq -r \
+          'if (type == "object" and .window_key != null and .episode_start_ts == null) then "yes" else "no" end' 2>/dev/null)
+      if [[ "$is_old_schema" = "yes" ]]; then
+          old_window_end_iso=$(echo "$existing_state" | jq -r '.window_end_iso // empty')
+          old_window_end_unix=$(to_unix "$old_window_end_iso")
+          if [[ -n "$old_window_end_unix" && "$old_window_end_unix" -le "$now_unix" ]]; then
+              closed_state=$(echo "$existing_state" | jq \
+                  '{episode_start_ts: .crossover_ts,
+                    triggers_ever:    ["five_hour"],
+                    sessions:         .sessions,
+                    total_overage_usd: .total_overage_usd}')
+              finalize_episode "$closed_state" "$old_window_end_iso"
+              existing_state=''
+          else
+              existing_state=$(echo "$existing_state" | jq \
+                  --arg r5 "${old_window_end_iso:-$five_hour_resets}" \
+                  --arg r7 "$seven_day_resets" \
+                  '{episode_start_ts: .crossover_ts,
+                    active_triggers:  {five_hour: true, seven_day: false},
+                    triggers_ever:    ["five_hour"],
+                    seen_resets:      {five_hour_at: $r5, seven_day_at: $r7},
+                    sessions:         .sessions,
+                    total_overage_usd: .total_overage_usd}')
+          fi
+      fi
   fi
 
   # ── Decide: finalize / restart / continue / start ───────────────────────────
